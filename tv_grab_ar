@@ -1,0 +1,654 @@
+#!/usr/bin/perl -w
+
+=pod
+
+=head1 NAME
+
+tv_grab_ar - Grab TV listings for Argentina.
+
+=head1 SYNOPSIS
+
+tv_grab_ar --help
+
+tv_grab_ar --configure [--config-file FILE] [--gui OPTION]
+
+tv_grab_ar [--config-file FILE] 
+           [--days N] [--offset N]
+           [--output FILE] [--quiet] [--debug]
+
+tv_grab_ar --list-channels [--config-file FILE]
+           [--output FILE] [--quiet] [--debug]
+                 
+                
+=head1 DESCRIPTION
+
+Output TV and listings in XMLTV format for many stations
+available in Argentina. 
+
+First you must run B<tv_grab_ar --configure> to choose which stations
+you want to receive.
+
+Then running B<tv_grab_ar> with no arguments will get a listings for
+the stations you chose for five days including today.
+
+=head1 OPTIONS
+
+B<--configure> Prompt for which stations to download and write the
+configuration file.
+
+B<--config-file FILE> Set the name of the configuration file, the
+default is B<~/.xmltv/tv_grab_ar.conf>.  This is the file written by
+B<--configure> and read when grabbing.
+
+B<--gui OPTION> Use this option to enable a graphical interface to be used.
+OPTION may be 'Tk', or left blank for the best available choice.
+Additional allowed values of OPTION are 'Term' for normal terminal output
+(default) and 'TermNoProgressBar' to disable the use of Term::ProgressBar.
+
+B<--output FILE> When grabbing, write output to FILE rather than
+standard output.
+
+B<--days N> When grabbing, grab N days rather than 5.
+
+B<--offset N> Start grabbing at today + N days.  N may be negative.
+
+B<--quiet> Suppress the progress-bar normally shown on standard error.
+
+B<--debug> Provide more information on progress to stderr to help in
+debugging.
+
+B<--list-channels>    Output a list of all channels that data is available
+                      for. The list is in xmltv-format.
+
+B<--version> Show the version of the grabber.
+
+B<--help> Print a help message and exit.
+
+=head1 ERROR HANDLING
+
+If the grabber fails to download data for some channel on a specific day, 
+it will print an errormessage to STDERR and then continue with the other
+channels and days. The grabber will exit with a status code of 1 to indicate 
+that the data is incomplete. 
+
+=head1 ENVIRONMENT VARIABLES
+
+The environment variable HOME can be set to change where configuration
+files are stored. All configuration is stored in $HOME/.xmltv/. On Windows,
+it might be necessary to set HOME to a path without spaces in it.
+
+=head1 SUPPORTED CHANNELS
+
+For information on supported channels, see http://www.cablevisionfibertel.com.ar/
+
+=head1 AUTHOR
+
+Mattias Holmlund, mattias -at- holmlund -dot- se. This documentation
+and parts of the code copied from tv_grab_uk by
+Ed Avis, ed -at- membled -dot- com.
+
+=head1 BUGS
+
+=cut
+
+use strict;
+
+use XMLTV;
+use XMLTV::ProgressBar;
+use XMLTV::Options qw/ParseOptions/;
+use XMLTV::Configure::Writer;
+
+use XML::LibXML;
+use Date::Manip;
+use Compress::Zlib;
+use File::Path;
+use File::Basename;
+use IO::Scalar;
+use LWP;
+
+my $ua;
+$ua = LWP::UserAgent->new();
+$ua->agent("xmltv/$XMLTV::VERSION");
+$ua->env_proxy();
+
+use HTTP::Cache::Transparent;
+
+# Although we use HTTP::Cache::Transparent, this undocumented --cache
+# option for debugging is still useful since it will _always_ use a
+# cached copy of a page, without contacting the server at all.
+#
+use XMLTV::Memoize; XMLTV::Memoize::check_argv('getuncompressed');
+
+sub t;
+
+my $default_root_url = "https://buscador.cablevisionfibertel.com.ar/TVGridWS/TvGridWS.asmx";
+
+my %services = ( 
+  'provinces' => 'GetProvinces?sitio=:site',
+  'cities' => 'GetLocalitys?sitio=:site&provincia=:province',
+  'city' => 'GetOneLocality?idLocalitySel=:city',
+  'channels' => 'GetAllSignalXML?clasDigId=:channel_type&digHd=1&genre='
+);
+
+my $default_cachedir = get_default_cachedir();
+
+my( $opt, $conf ) = ParseOptions( { 
+    grabber_name => "tv_grab_ar",
+    capabilities => [qw/baseline manualconfig tkconfig apiconfig cache/],
+    stage_sub => \&config_stage,
+    listchannels_sub => \&list_channels,
+    load_old_config_sub => \&load_old_config,
+    version => '$Id: tv_grab_se_swedb.in,v 1.8 2010/10/01 17:49:30 dekarl Exp $',
+    description => "Argentina (Cablevision)",
+
+} );
+
+if (not defined( $conf->{cachedir} )) {
+    print STDERR "No cachedir defined in configfile " . 
+                 $opt->{'config-file'} . "\n" .
+                 "Please run the grabber with --configure.\n";
+    exit 1;
+}
+
+if (not defined( $conf->{'root-url'} )) {
+    print STDERR "No root-url defined in configfile " .
+                 $opt->{'config-file'} . "\n" .
+                 "Please run the grabber with --configure.\n";
+    exit 1;
+}
+
+if (not defined( $conf->{'channel'} )) {
+    print STDERR "No channels selected in configfile " .
+                 $opt->{'config-file'} . "\n" .
+                 "Please run the grabber with --configure.\n";
+    exit 1;
+}
+
+init_cachedir( $conf->{cachedir}->[0] );
+HTTP::Cache::Transparent::init( { 
+    BasePath => $conf->{cachedir}->[0],
+    NoUpdate => 15*60,
+    Verbose => $opt->{debug},
+    } );
+
+binmode (STDOUT);
+
+my($xmldecl, $channels) = load_channels( $conf );
+
+my( $odoc, $root );
+my $warnings = 0;
+
+write_header( $xmldecl );
+
+write_channel_list( $conf->{channel} );
+
+my $now = ParseDate( 'now' );
+my $date =$now;
+$date = DateCalc( $now, "+$opt->{offset} days" ) 
+    if( $opt->{offset} );
+
+my $bar = undef;
+$bar = new XMLTV::ProgressBar( {
+    name => 'downloading listings',
+    count => $opt->{days} * @{$conf->{channel}},
+    }) if (not $opt->{quiet}) && (not $opt->{debug});
+
+for( my $i=0; $i < $opt->{days}; $i++ )
+{
+    t "Date: $date";
+    foreach my $channel_id (@{$conf->{channel}})
+    {
+        # We have already warned the user if the channel doesn't exist.
+        if( exists $channels->{$channel_id} )
+        {
+            t "  $channel_id";
+            my( $channel_name, $url ) = @{$channels->{$channel_id}};
+            print_data( $url, $channel_id, $date )
+                or warning( "Failed to download data for $channel_id on " . 
+                            UnixDate( $date, "%Y-%m-%d" ) . "." );
+        }
+        $bar->update() if defined( $bar );
+    }
+    $date = DateCalc( $date, "+1 days" );
+}
+
+$bar->finish() if defined $bar;
+
+write_footer();
+
+# Signal that something went wrong if there were warnings.
+exit(1) if $warnings;
+
+# All data fetched ok.
+t "Exiting without warnings.";
+exit(0);
+
+sub t
+{
+    my( $message ) = @_;
+    print STDERR $message . "\n" if $opt->{debug};
+}
+
+sub warning
+{
+    my( $message ) = @_;
+    print STDERR $message . "\n";
+    $warnings++;
+}
+
+sub list_channels
+{
+    my( $conf, $opt ) = @_;
+
+    ( $xmldecl, $channels ) = load_channels( $conf );
+    
+    my $result="";
+    my $fh = new IO::Scalar \$result;
+    my $oldfh = select( $fh );
+    write_header( $xmldecl );
+    write_channel_list( [sort keys %{$channels}] );
+    write_footer();
+    select( $oldfh );
+    $fh->close();
+
+    return $result;
+}
+
+sub config_stage
+{
+    my( $stage, $conf ) = @_;
+
+
+    my $result;
+
+    my $writer = new XMLTV::Configure::Writer( OUTPUT => \$result,
+                                               encoding => 'iso-8859-1' );
+    $writer->start( { grabber => 'tv_grab_ar' } );
+
+    if ( $stage eq "start" )
+    {
+
+      $writer->write_string( {
+          id => 'cachedir', 
+          title => [ 
+            [ 'Directory to store the cache in', 'en' ], 
+            [ 'Directorio donde almacenar la cache', 'es' ] ],
+          description => [ 
+           [ 'tv_grab_ar uses a cache with files that it has already '. 
+             'downloaded. Please specify where the cache shall be stored. ', 
+             'en' ],
+           [ 'tv_grab_ar utiliza una cache con archivos que ha descargado '. 
+             'previamente. Por favor especifique el directorio donde almacenarlos. ',
+             'es' ] ],
+          default => $default_cachedir,
+       } );
+
+      $writer->write_string( {
+          id => 'root-url', 
+          title => [ 
+            [ 'Root URL for grabbing data', 'en' ],
+            [ 'URL base para obtener los datos', 'es' ] ],
+          description => [ 
+           [ 'At this URL you will find a description of provided services', 'en' ],
+           [ 'En esta URL se provee info de los servicios de la API', 'es'] ],
+          default => $default_root_url,
+       } );
+
+     $writer->write_string( {
+         id => "site",
+         title => [
+           [ 'Site', 'en'],
+           [ 'Sitio', 'es'] ],
+         description => [
+           [ 'Provider site parameter used in Web Services calls. CF works for '.
+             'La Plata, Bs As. ', 'en' ],
+           [ 'Parametro site usado por las llamadas a Web Services. CF funciona '.
+             'para La Plata, Bs As. ', 'es' ] ],
+         default => "CF"
+       } );
+
+      $writer->end( 'select-province' );
+
+    }elsif( $stage eq 'select-province' )
+    {
+
+      $writer->start_selectone( {
+          id => 'province',
+          title => [ 
+            [ 'Province', 'en' ],
+            [ 'Provincia', 'es' ] ],
+          description => [ [ 'Select your provider Province.', 'en' ],
+            [ 'Seleccione la provincia del proveedor', 'es' ] ],
+        } );
+
+
+      foreach my $province ( provinces( $conf )) {
+        $writer->write_option( {
+            value => $province,
+            text  => [
+              [ $province, 'en' ],
+              [ $province, 'es' ]]
+          } );
+      }
+
+      $writer->end_selectone();
+
+      $writer->end( 'select-city' );
+
+    }elsif( $stage eq 'select-city' )
+    {
+
+      $writer->start_selectone( {
+          id => 'city',
+          title => [ 
+            [ 'City', 'en' ],
+            [ 'Ciudad', 'es' ] ],
+          description => [ [ 'Select your provider City.', 'en' ],
+            [ 'Seleccione la ciudad del proveedor', 'es' ] ],
+        } );
+
+
+      foreach my $city ( cities( $conf )) {
+        $writer->write_option( {
+            value => $city->{id},
+            text  => [
+              [ $city->{text}, 'en' ],
+              [ $city->{text}, 'es' ]]
+          } );
+      }
+
+      $writer->end_selectone();
+
+      $writer->end( 'select-channels' );
+
+
+    }else {
+
+      die "Unknown stage $stage"; 
+
+    }
+    return $result;
+}
+
+#
+# Load a configuration file in the old format.
+#
+
+sub load_old_config
+{
+    my( $config_file ) = @_;
+
+    my @lines = XMLTV::Config_file::read_lines( $config_file );
+    
+    my $conf = {};
+    $conf->{cachedir}->[0] = $default_cachedir;
+    $conf->{'root-url'}->[0] = $default_root_url;
+    $conf->{channel} = [];
+
+    foreach my $line (@lines)
+    {
+        next unless defined $line;
+
+        my( $command, $param ) = split( /\s+/, $line, 2 );
+        $param =~ tr/\n\r//d;
+        $param =~ s/\s+$//;
+
+        if ( $command =~ /^\s*root-url\s*$/) {
+            $conf->{'root-url'}->[0] = $param;
+        } elsif  ( $command =~ /^\s*channel\s*$/) {
+            push @{$conf->{channel}}, $param;
+        } elsif ( $command eq 'cache-dir' ) {
+            $conf->{'cachedir'}->[0] = $param;
+        } else {
+            die "Unknown command $command in config-file $config_file"
+        }
+    }
+
+    return $conf;
+}
+
+sub get_default_cachedir
+{
+    my $winhome = $ENV{HOMEDRIVE} . $ENV{HOMEPATH} 
+    if defined( $ENV{HOMEDRIVE} ) 
+        and defined( $ENV{HOMEPATH} ); 
+    
+    my $home = $ENV{HOME} || $winhome || ".";
+    return "$home/.xmltv/cache";
+}
+
+sub init_cachedir
+{
+    my( $path ) = @_;
+    if( not -d $path )
+    {
+        mkpath( $path ) or die "Failed to create cache-directory $path: $@";
+    }
+}
+
+sub provinces
+{
+    my( $conf ) = @_;
+
+    my $url = service_url( 'provinces', $conf );
+
+    my $xmldata = getuncompressed( $url );
+
+    defined( $xmldata ) or die "Failed to fetch $url";
+
+    my $xml = XML::LibXML::XPathContext->new( );
+
+    $xml->registerNs( 'x', 'http://tempuri.org/');
+
+    my $doc = XML::LibXML->new->parse_string($xmldata);
+
+    my @provinces;
+
+    foreach my $node ($xml->findnodes('//x:Provincia', $doc))
+    {
+          push(@provinces, $node->textContent);
+    }
+
+    return @provinces;
+
+}
+
+sub cities
+{
+    my( $conf ) = @_;
+
+    my $url = service_url( 'cities', $conf );
+    die( $url);
+
+    my $xmldata = getuncompressed( $url );
+
+    defined( $xmldata ) or die "Failed to fetch $url";
+
+    my $xml = XML::LibXML::XPathContext->new( );
+
+    $xml->registerNs( 'x', 'http://tempuri.org/');
+
+    my $doc = XML::LibXML->new->parse_string($xmldata);
+
+    my @provinces;
+
+    foreach my $node ($xml->findnodes('//x:Provincia', $doc))
+    {
+          push(@provinces, $node->textContent);
+    }
+
+    return @provinces;
+
+}
+
+sub service_url
+{
+  my( $id, $conf) = @_;
+
+  my $url = $conf->{'root-url'}[0].'/'.$services{$id};
+
+  if( $id eq 'provinces' )
+  {
+    $url =~ s/:site/$conf->{'site'}[0]/g;
+  }
+  elsif( $id eq 'cities' )
+  {
+    $url =~ s/:site/$conf->{'site'}[0]/g;
+    $url =~ s/:province/$conf->{'province'}[0]/g;
+  }
+  elsif( $id eq 'city' )
+  {
+    $url =~ s/:city/$conf->{'city'}[0]/g;
+  }
+  else{
+    die "Service $id is unknown";
+  }
+  
+  return $url;
+}
+
+sub load_channels
+{
+    my( $conf ) = @_;
+
+    my $url = $conf->{'root-url'}[0];
+    die $url;
+
+    
+    my %channels;
+
+    my $xmldata = getuncompressed( $url );
+
+    defined( $xmldata ) or die "Failed to fetch $url";
+
+    my $xml = XML::LibXML->new;
+    
+    my $doc = $xml->parse_string($xmldata);
+
+    my $xmldecl = "<?xml version='" . $doc->version() . "' " . 
+        "encoding='" . $doc->encoding() . "'?>\n";
+
+    my $ns = $doc->find( "//channel" );
+
+    foreach my $node ($ns->get_nodelist)
+    {
+        my $id = $node->findvalue( '@id' );
+        my $name = $node->findvalue( 'display-name[1]' );
+        my $url = $node->findvalue( 'base-url' );
+        my $urlns = $node->find( './base-url' );
+        foreach my $urlnode ($urlns->get_nodelist)
+        {
+            $node->removeChild( $urlnode );
+        }
+        $channels{$id} = [ $name, $url, $node->toString(0, 1) ];
+    }
+
+    return ($xmldecl, \%channels);
+}
+
+sub print_data
+{
+    my( $rooturl, $channel_id, $date ) = @_;
+    
+    my $url = $rooturl . $channel_id . "_" . UnixDate( $date, "%Y-%m-%d" ) . 
+        ".xml.gz";
+
+    my $xmldata = getuncompressed( $url );
+
+    defined $xmldata or return 0;
+
+    my $in = new IO::Scalar \$xmldata;
+    while( my $line = $in->getline() )
+    {
+        last if $line =~ /<tv/;
+    }
+
+    while( my $line = $in->getline() )
+    {
+        last if $line =~ /<\/tv>/;
+        print $line;
+    }
+
+    return 1;
+}
+
+sub write_header
+{
+    my( $xmldecl ) = @_;
+
+    # Use the same xml declaration as the one in
+    # channels.xml
+    print $xmldecl;
+    print '<!DOCTYPE tv SYSTEM "xmltv.dtd">' . "\n";
+    print "<tv>\n";
+}
+
+sub write_channel_list
+{
+    my( $channel_list ) = @_;
+
+    # Write list of channels.
+    t 'Writing list of channels.';
+
+    foreach my $channel_id (@{$channel_list})
+    {
+        if( not exists $channels->{$channel_id} )
+        {
+            print STDERR "Unknown channel $channel_id." .
+                " See http://www.cablevisionfibertel.com.ar/" . 
+                " for a list of available channels or run" . 
+                " tv_grab_ar --configure to reconfigure.\n";
+            next;
+        }
+        
+        my( $channel_name, $url, $def ) = @{$channels->{$channel_id}};
+        print "  $def\n";
+    }
+}
+
+sub write_footer
+{
+    print "</tv>\n";
+}
+
+sub getuncompressed {
+    my( $url ) = @_;
+
+    my $response = $ua->get($url);
+
+    return undef
+        unless $response->is_success;
+
+    my $compressed = $response->content
+        or return undef;
+
+    # Since LWP 5.827, the result from get() is already
+    # uncompressed.
+
+    my $uncompressed;
+
+    eval {
+	$uncompressed = Compress::Zlib::memGunzip( \$compressed );
+    };
+
+    $uncompressed = $compressed if not defined $uncompressed;
+
+    return $uncompressed;
+}
+
+### Setup indentation in Emacs
+## Local Variables:
+## perl-indent-level: 4
+## perl-continued-statement-offset: 4
+## perl-continued-brace-offset: 0
+## perl-brace-offset: -4
+## perl-brace-imaginary-offset: 0
+## perl-label-offset: -2
+## cperl-indent-level: 4
+## cperl-brace-offset: 0
+## cperl-continued-brace-offset: 0
+## cperl-label-offset: -2
+## cperl-extra-newline-before-brace: t
+## cperl-merge-trailing-else: nil
+## cperl-continued-statement-offset: 2
+## End:
