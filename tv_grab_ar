@@ -124,10 +124,11 @@ sub t;
 my $default_root_url = "https://buscador.cablevisionfibertel.com.ar/TVGridWS/TvGridWS.asmx";
 
 my %services = ( 
-  'provinces' => 'GetProvinces?sitio=:site',
-  'cities' => 'GetLocalitys?sitio=:site&provincia=:province',
-  'city' => 'GetOneLocality?idLocalitySel=:city',
-  'channels' => 'GetAllSignalXML?clasDigId=:channel_type&digHd=1&genre='
+  'provinces'     => 'GetProvinces?sitio=:site',
+  'cities'        => 'GetLocalitys?sitio=:site&provincia=:province',
+  'city'          => 'GetOneLocality?idLocalitySel=:city',
+  'channels'      => 'GetAllSignalXML?clasDigId=:type_of_service&digHd=1&genre=',
+  'channel_data'  => 'ReloadContentGridChannel?quantityDays=:days&idSignal=:channel_id'
 );
 
 my $default_cachedir = get_default_cachedir();
@@ -182,34 +183,23 @@ write_header( $xmldecl );
 
 write_channel_list( $conf->{channel} );
 
-my $now = ParseDate( 'now' );
-my $date =$now;
-$date = DateCalc( $now, "+$opt->{offset} days" ) 
-    if( $opt->{offset} );
-
 my $bar = undef;
 $bar = new XMLTV::ProgressBar( {
     name => 'downloading listings',
     count => $opt->{days} * @{$conf->{channel}},
     }) if (not $opt->{quiet}) && (not $opt->{debug});
 
-for( my $i=0; $i < $opt->{days}; $i++ )
+foreach my $channel_id (@{$conf->{channel}})
 {
-    t "Date: $date";
-    foreach my $channel_id (@{$conf->{channel}})
+    # We have already warned the user if the channel doesn't exist.
+    if( exists $channels->{$channel_id} )
     {
-        # We have already warned the user if the channel doesn't exist.
-        if( exists $channels->{$channel_id} )
-        {
-            t "  $channel_id";
-            my( $channel_name, $url ) = @{$channels->{$channel_id}};
-            print_data( $url, $channel_id, $date )
-                or warning( "Failed to download data for $channel_id on " . 
-                            UnixDate( $date, "%Y-%m-%d" ) . "." );
-        }
-        $bar->update() if defined( $bar );
+        my( $channel_name, $icon, $number ) = @{$channels->{$channel_id}};
+        t "  $channel_name";
+        print_data( $conf, $channel_id, $opt->{offset}, $opt->{days} )
+            or warning( "Failed to download data for $channel_name");
     }
-    $date = DateCalc( $date, "+1 days" );
+    $bar->update() if defined( $bar );
 }
 
 $bar->finish() if defined $bar;
@@ -267,6 +257,9 @@ sub config_stage
 
     if ( $stage eq "start" )
     {
+      #########################################################################
+      # Select Base configuration parameters: cachedir, root-url & site
+      #########################################################################
 
       $writer->write_string( {
           id => 'cachedir', 
@@ -307,10 +300,24 @@ sub config_stage
          default => "CF"
        } );
 
+     $writer->write_string( {
+         id => "tz",
+         title => [
+           [ 'Timezone', 'en'],
+           [ 'Zona horaria', 'es'] ],
+         description => [
+           [ 'Select your timezone ', 'en' ],
+           [ 'Seleccione su zona horaria', 'es' ] ],
+         default => "-0300"
+       } );
+
       $writer->end( 'select-province' );
 
     }elsif( $stage eq 'select-province' )
     {
+      #########################################################################
+      # Select Province
+      #########################################################################
 
       $writer->start_selectone( {
           id => 'province',
@@ -337,6 +344,9 @@ sub config_stage
 
     }elsif( $stage eq 'select-city' )
     {
+      #########################################################################
+      # Select City
+      #########################################################################
 
       $writer->start_selectone( {
           id => 'city',
@@ -352,8 +362,34 @@ sub config_stage
         $writer->write_option( {
             value => $city->{id},
             text  => [
-              [ $city->{text}, 'en' ],
-              [ $city->{text}, 'es' ]]
+              [ $city->{name}, 'en' ],
+              [ $city->{name}, 'es' ]]
+          } );
+      }
+
+      $writer->end_selectone();
+
+      $writer->end('select-type-of-service');
+
+    }elsif( $stage eq 'select-type-of-service' )
+    {
+
+      #########################################################################
+      # Select Type of service
+      #########################################################################
+
+      $writer->start_selectone( {
+          id => 'type_of_service',
+          title => [ 
+            [ 'Type of service', 'en' ],
+            [ 'Tipo de Servicio', 'es' ] ],
+          description => [ [ 'Select your service.', 'en' ],
+            [ 'Seleccione el servicio contratado', 'es' ] ],
+        } );
+      foreach my $type_of_service ( types_of_service( $conf )) {
+        $writer->write_option( {
+            value => $type_of_service->{id},
+            text  => $type_of_service->{name}
           } );
       }
 
@@ -426,11 +462,11 @@ sub init_cachedir
     }
 }
 
-sub provinces
+sub call_service_url
 {
-    my( $conf ) = @_;
+    my( $service, $query, $conf, $options ) = @_;
 
-    my $url = service_url( 'provinces', $conf );
+    my $url = service_url( $service, $conf, $options );
 
     my $xmldata = getuncompressed( $url );
 
@@ -442,48 +478,60 @@ sub provinces
 
     my $doc = XML::LibXML->new->parse_string($xmldata);
 
+    return $xml->findnodes( $query, $doc );
+}
+
+sub provinces
+{
+    my( $conf ) = @_;
+
     my @provinces;
 
-    foreach my $node ($xml->findnodes('//x:Provincia', $doc))
+    foreach my $node (call_service_url('provinces', '//x:Provincia', $conf))
     {
           push(@provinces, $node->textContent);
     }
 
     return @provinces;
-
 }
 
 sub cities
 {
     my( $conf ) = @_;
 
-    my $url = service_url( 'cities', $conf );
-    die( $url);
+    my @cities;
 
-    my $xmldata = getuncompressed( $url );
-
-    defined( $xmldata ) or die "Failed to fetch $url";
-
-    my $xml = XML::LibXML::XPathContext->new( );
-
-    $xml->registerNs( 'x', 'http://tempuri.org/');
-
-    my $doc = XML::LibXML->new->parse_string($xmldata);
-
-    my @provinces;
-
-    foreach my $node ($xml->findnodes('//x:Provincia', $doc))
+    foreach my $node (call_service_url('cities', '//x:Technology', $conf))
     {
-          push(@provinces, $node->textContent);
+      my $id = $node->getChildrenByTagName('Id')->[0]->textContent;
+      my $city = $node->getChildrenByTagName('Localidad')->[0]->textContent;
+      push( @cities, { id => $id, name => $city });
     }
 
-    return @provinces;
+    return @cities;
+}
 
+sub types_of_service
+{
+    my( $conf ) = @_;
+
+    my @types;
+
+    my $city_description = call_service_url('city', '//x:Technology', $conf);
+
+    my $classic = $city_description->[0]->getChildrenByTagName('ClasicoId');
+    my $digital = $city_description->[0]->getChildrenByTagName('DigitalId');
+
+    push( @types, {id => $classic, name => [['Classic', 'en'],['Clasico','es']] } ) if defined($classic);
+
+    push( @types, {id => $digital, name => [['Digital', 'en'],['Digital','es']] } ) if defined($digital);
+
+    return @types;
 }
 
 sub service_url
 {
-  my( $id, $conf) = @_;
+  my( $id, $conf, $options) = @_;
 
   my $url = $conf->{'root-url'}[0].'/'.$services{$id};
 
@@ -500,10 +548,19 @@ sub service_url
   {
     $url =~ s/:city/$conf->{'city'}[0]/g;
   }
+  elsif( $id eq 'channels' )
+  {
+    $url =~ s/:type_of_service/$conf->{'type_of_service'}[0]/g;
+  }
+  elsif( $id eq 'channel_data' )
+  {
+    $url =~ s/:days/$options->{days}/g;
+    $url =~ s/:channel_id/$options->{channel_id}/g;
+  }
   else{
     die "Service $id is unknown";
   }
-  
+
   return $url;
 }
 
@@ -511,62 +568,85 @@ sub load_channels
 {
     my( $conf ) = @_;
 
-    my $url = $conf->{'root-url'}[0];
-    die $url;
-
-    
     my %channels;
 
-    my $xmldata = getuncompressed( $url );
-
-    defined( $xmldata ) or die "Failed to fetch $url";
-
-    my $xml = XML::LibXML->new;
-    
-    my $doc = $xml->parse_string($xmldata);
-
-    my $xmldecl = "<?xml version='" . $doc->version() . "' " . 
-        "encoding='" . $doc->encoding() . "'?>\n";
-
-    my $ns = $doc->find( "//channel" );
-
-    foreach my $node ($ns->get_nodelist)
+    foreach my $node (call_service_url('channels', '//x:Signal', $conf))
     {
-        my $id = $node->findvalue( '@id' );
-        my $name = $node->findvalue( 'display-name[1]' );
-        my $url = $node->findvalue( 'base-url' );
-        my $urlns = $node->find( './base-url' );
-        foreach my $urlnode ($urlns->get_nodelist)
-        {
-            $node->removeChild( $urlnode );
-        }
-        $channels{$id} = [ $name, $url, $node->toString(0, 1) ];
+      my $id = $node->getChildrenByTagName('Id')->[0]->textContent;
+      if ($id > 0)
+      {
+        my $name    = $node->getChildrenByTagName('Name')->[0]->textContent;
+        my $icon    = $node->getChildrenByTagName('LogoImage')->[0]->textContent;
+        my $number  = $node->getChildrenByTagName('NumberSignal')->[0]->textContent;
+
+        $channels{$id} = [ $name, $icon, $number ]
+      }
     }
 
-    return ($xmldecl, \%channels);
+    return ("<?xml version='1.0' encoding='ISO-8859-1'?>\n", \%channels);
 }
 
 sub print_data
 {
-    my( $rooturl, $channel_id, $date ) = @_;
-    
-    my $url = $rooturl . $channel_id . "_" . UnixDate( $date, "%Y-%m-%d" ) . 
-        ".xml.gz";
+    my( $conf, $channel_id, $offset, $days ) = @_;
 
-    my $xmldata = getuncompressed( $url );
+    my $now  = ParseDate( 'now' );
+    my $date = $now;
 
-    defined $xmldata or return 0;
+    $date = DateCalc( $now, "+$offset days" ) if ($offset > 0);
 
-    my $in = new IO::Scalar \$xmldata;
-    while( my $line = $in->getline() )
+    $date = Date_SetTime($date,0,0,0);
+
+    foreach my $node (call_service_url('channel_data', '/x:string', $conf, {channel_id => $channel_id, days => $offset + $days})) 
     {
-        last if $line =~ /<tv/;
-    }
+      my $doc = XML::LibXML->new->load_html( string => $node->textContent, recover => 2, suppress_errors => 1, suppress_warnings => 1);
 
-    while( my $line = $in->getline() )
-    {
-        last if $line =~ /<\/tv>/;
-        print $line;
+      my $xml = XML::LibXML::XPathContext->new( $doc );
+
+      foreach my $node ($xml->findnodes('//div[contains(@id,"contenedorProgramas")]/div[contains(@class,"columnChannel")]'))
+      {
+        if ($offset > 0)
+        {
+          $offset--;
+          next;
+        }
+
+        foreach my $entry ($node->findnodes('//div[contains(@class,"programaChannel")]'))
+        {
+          my $title = $entry->findvalue('./span[contains(@class,"titleChannel")]');
+          my $season = $entry->findvalue('./span[contains(@class,"titleSeason")]');
+          $season =~ s/^\s*\w:\s+//i;
+          my $episode = $entry->findvalue('./span[contains(@class,"titleChapter")]');
+          $episode =~ s/^\s*\w:\s+//i;
+
+          next if $title eq '';
+
+          my $top = $entry->getAttribute('style');
+
+          next unless $top =~ /top:\s+(\d+)px/;
+
+          $top=~ s/.*top:\s+(\d+)px.*/$1/;
+
+          my $mins = $top * 0.5;
+
+          my $start_at = UnixDate(DateCalc($date,"$mins minutes"), "%q ".$conf->{tz}->[0]);
+
+          print "  <programme start='$start_at' channel='$channel_id'>\n"; 
+          print "    <title>$title</title>\n";
+          if ($episode ne '' and $season ne '')
+          {
+            print "    <sub-title>$season | $episode</sub-title>\n";
+            $season =~ s/^[^\d]*(\d+).*$/$1/g;
+            $episode =~ s/^[^\d]*(\d+).*$/$1/g;
+            print "    <episode-num system='xmltv_ns'>".($season-1).".".($episode-1)."</episode-num>\n"
+              if ($season =~ /^\d+?$/ and $episode =~ /^\d+?$/);
+          }
+          print "  <programme>\n";
+          print "\n";
+        }
+        $date    = DateCalc( $date, "+1 day" ); 
+      }
+
     }
 
     return 1;
@@ -600,9 +680,14 @@ sub write_channel_list
                 " tv_grab_ar --configure to reconfigure.\n";
             next;
         }
-        
-        my( $channel_name, $url, $def ) = @{$channels->{$channel_id}};
-        print "  $def\n";
+
+        my( $channel_name, $icon, $number ) = @{$channels->{$channel_id}};
+        $channel_name =~ s/&/&amp;/sg;
+        print "<channel id='".$channel_id."'>\n".
+          "  <display-name>". $channel_name  ."</display-name>\n".
+          "  <display-name>". $number  ."</display-name>\n".
+          "  <icon src='".$icon."'/>\n".
+          "</channel>\n";
     }
 }
 
@@ -628,7 +713,7 @@ sub getuncompressed {
     my $uncompressed;
 
     eval {
-	$uncompressed = Compress::Zlib::memGunzip( \$compressed );
+      $uncompressed = Compress::Zlib::memGunzip( \$compressed );
     };
 
     $uncompressed = $compressed if not defined $uncompressed;
