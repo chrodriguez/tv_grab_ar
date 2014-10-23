@@ -186,17 +186,18 @@ write_channel_list( $conf->{channel} );
 my $bar = undef;
 $bar = new XMLTV::ProgressBar( {
     name => 'downloading listings',
-    count => $opt->{days} * @{$conf->{channel}},
+    count => 1 * @{$conf->{channel}},
     }) if (not $opt->{quiet}) && (not $opt->{debug});
 
 foreach my $channel_id (@{$conf->{channel}})
 {
+    my $id = get_id_of_channel($channel_id);
     # We have already warned the user if the channel doesn't exist.
-    if( exists $channels->{$channel_id} )
+    if( exists $channels->{$id} )
     {
-        my( $channel_name, $icon, $number ) = @{$channels->{$channel_id}};
+        my( $channel_name, $icon, $number ) = @{$channels->{$id}};
         t "  $channel_name";
-        print_data( $conf, $channel_id, $opt->{offset}, $opt->{days} )
+        print_data( $conf, $id, $opt->{offset}, $opt->{days} )
             or warning( "Failed to download data for $channel_name");
     }
     $bar->update() if defined( $bar );
@@ -597,21 +598,17 @@ sub print_data
 
     $date = Date_SetTime($date,0,0,0);
 
-    foreach my $node (call_service_url('channel_data', '/x:string', $conf, {channel_id => $channel_id, days => $offset + $days})) 
+    foreach my $day_node (call_service_url('channel_data', '/x:string', $conf, {channel_id => $channel_id, days => $offset + $days})) 
     {
-      my $doc = XML::LibXML->new->load_html( string => $node->textContent, recover => 2, suppress_errors => 1, suppress_warnings => 1);
+      my $doc = XML::LibXML->new->load_html( string => $day_node->textContent, recover => 2, suppress_errors => 1, suppress_warnings => 1);
 
       my $xml = XML::LibXML::XPathContext->new( $doc );
 
       foreach my $node ($xml->findnodes('//div[contains(@id,"contenedorProgramas")]/div[contains(@class,"columnChannel")]'))
       {
-        if ($offset > 0)
-        {
-          $offset--;
-          next;
-        }
+        next if ($offset-- > 0);
 
-        foreach my $entry ($node->findnodes('//div[contains(@class,"programaChannel")]'))
+        foreach my $entry ($node->findnodes('.//div[contains(@class,"programaChannel")]'))
         {
           my $title = $entry->findvalue('./span[contains(@class,"titleChannel")]');
           my $season = $entry->findvalue('./span[contains(@class,"titleSeason")]');
@@ -631,17 +628,18 @@ sub print_data
 
           my $start_at = UnixDate(DateCalc($date,"$mins minutes"), "%q ".$conf->{tz}->[0]);
 
-          print "  <programme start='$start_at' channel='$channel_id'>\n"; 
-          print "    <title>$title</title>\n";
+          print "  <programme start='$start_at' channel='".channel_id($channel_id)."'>\n"; 
+          print "    <title>".normalize_string($title)."</title>\n";
           if ($episode ne '' and $season ne '')
           {
-            print "    <sub-title>$season | $episode</sub-title>\n";
+            print "    <sub-title>".normalize_string($season)." | ".normalize_string($episode)."</sub-title>\n";
             $season =~ s/^[^\d]*(\d+).*$/$1/g;
+            $season = --$season >= 0 ? $season : 0;
             $episode =~ s/^[^\d]*(\d+).*$/$1/g;
-            print "    <episode-num system='xmltv_ns'>".($season-1).".".($episode-1)."</episode-num>\n"
-              if ($season =~ /^\d+?$/ and $episode =~ /^\d+?$/);
+            $episode = --$episode >= 0 ? $episode : 0;
+            print "    <episode-num system='xmltv_ns'>$season.$episode.0</episode-num>\n";
           }
-          print "  <programme>\n";
+          print "  </programme>\n";
           print "\n";
         }
         $date    = DateCalc( $date, "+1 day" ); 
@@ -663,6 +661,26 @@ sub write_header
     print "<tv>\n";
 }
 
+sub normalize_string
+{
+  my( $string ) = @_;
+  $string =~ s/&/&amp;/sg;
+  return $string;
+}
+
+sub channel_id
+{
+  my( $id ) = @_;
+  return "cablevision.$id";
+}
+
+sub get_id_of_channel
+{
+  my( $channel_id ) = @_;
+  $channel_id =~ s/^cablevision\.//;
+  return $channel_id;
+}
+
 sub write_channel_list
 {
     my( $channel_list ) = @_;
@@ -672,7 +690,9 @@ sub write_channel_list
 
     foreach my $channel_id (@{$channel_list})
     {
-        if( not exists $channels->{$channel_id} )
+        my $id = get_id_of_channel($channel_id);
+
+        if( not exists $channels->{$id} )
         {
             print STDERR "Unknown channel $channel_id." .
                 " See http://www.cablevisionfibertel.com.ar/" . 
@@ -681,9 +701,10 @@ sub write_channel_list
             next;
         }
 
-        my( $channel_name, $icon, $number ) = @{$channels->{$channel_id}};
-        $channel_name =~ s/&/&amp;/sg;
-        print "<channel id='".$channel_id."'>\n".
+        my( $channel_name, $icon, $number ) = @{$channels->{$id}};
+
+        $channel_name = normalize_string($channel_name);
+        print "<channel id='".channel_id($id)."'>\n".
           "  <display-name>". $channel_name  ."</display-name>\n".
           "  <display-name>". $number  ."</display-name>\n".
           "  <icon src='".$icon."'/>\n".
