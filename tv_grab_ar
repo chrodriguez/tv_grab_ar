@@ -105,6 +105,8 @@ use File::Path;
 use File::Basename;
 use IO::Scalar;
 use LWP;
+use URI::Split qw(uri_split uri_join);
+use Encode qw(encode decode);
 
 my $ua;
 $ua = LWP::UserAgent->new();
@@ -128,7 +130,8 @@ my %services = (
   'cities'        => 'GetLocalitys?sitio=:site&provincia=:province',
   'city'          => 'GetOneLocality?idLocalitySel=:city',
   'channels'      => 'GetAllSignalXML?clasDigId=:type_of_service&digHd=1&genre=',
-  'channel_data'  => 'ReloadContentGridChannel?quantityDays=:days&idSignal=:channel_id'
+  'channel_data'  => 'ReloadContentGridChannel?quantityDays=:days&idSignal=:channel_id&sitio=:sitio',
+  'programme_description' => ''
 );
 
 my $default_cachedir = get_default_cachedir();
@@ -253,7 +256,7 @@ sub config_stage
     my $result;
 
     my $writer = new XMLTV::Configure::Writer( OUTPUT => \$result,
-                                               encoding => 'iso-8859-1' );
+                                               encoding => 'utf8' );
     $writer->start( { grabber => 'tv_grab_ar' } );
 
     if ( $stage eq "start" )
@@ -477,7 +480,7 @@ sub call_service_url
 
     $xml->registerNs( 'x', 'http://tempuri.org/');
 
-    my $doc = XML::LibXML->new->parse_string($xmldata);
+    my $doc = XML::LibXML->new(recover => 2, suppress_errors => 1, suppress_warnings => 1)->parse_string($xmldata);
 
     return $xml->findnodes( $query, $doc );
 }
@@ -557,6 +560,12 @@ sub service_url
   {
     $url =~ s/:days/$options->{days}/g;
     $url =~ s/:channel_id/$options->{channel_id}/g;
+    $url =~ s/:sitio/$conf->{'site'}[0]/g;
+  }
+  elsif( $id eq 'programme_description' )
+  {
+    my ($scheme, $auth, $path, $query, $frag) = uri_split($conf->{'root-url'}->[0]);
+    $url = uri_join($scheme, $auth).'/'.$options->{relative_url};
   }
   else{
     die "Service $id is unknown";
@@ -584,7 +593,7 @@ sub load_channels
       }
     }
 
-    return ("<?xml version='1.0' encoding='ISO-8859-1'?>\n", \%channels);
+    return ("<?xml version='1.0' encoding='utf-8'?>\n", \%channels);
 }
 
 sub print_data
@@ -632,13 +641,14 @@ sub print_data
           print "    <title>".normalize_string($title)."</title>\n";
           if ($episode ne '' and $season ne '')
           {
-            print "    <sub-title>".normalize_string($season)." | ".normalize_string($episode)."</sub-title>\n";
+            print "    <sub-title> Season ".normalize_string($season)." | Episode ".normalize_string($episode)."</sub-title>\n";
             $season =~ s/^[^\d]*(\d+).*$/$1/g;
             $season = --$season >= 0 ? $season : 0;
             $episode =~ s/^[^\d]*(\d+).*$/$1/g;
             $episode = --$episode >= 0 ? $episode : 0;
             print "    <episode-num system='xmltv_ns'>$season.$episode.0</episode-num>\n";
           }
+          print programme_description($conf, $entry->parentNode->getAttribute('href'));
           print "  </programme>\n";
           print "\n";
         }
@@ -648,6 +658,42 @@ sub print_data
     }
 
     return 1;
+}
+
+sub programme_description
+{
+  my ($conf, $relative_url) = @_;
+
+    my $url = service_url( 'programme_description', $conf, {relative_url => $relative_url });
+
+    my $xmldata = getuncompressed( $url );
+
+    defined( $xmldata ) or die "Failed to fetch $url";
+
+    my $xml = XML::LibXML::XPathContext->new( );
+
+    my $doc = XML::LibXML->new->load_html( string => $xmldata, recover => 2, suppress_errors => 1, suppress_warnings => 1);
+
+    my $description = '';
+    foreach my $detail ($xml->findnodes( '//a[contains(@class,"resumenFicha")]', $doc ))
+    {
+      $description .= '<desc lang="es">'.$detail->textContent.'</desc>';
+    }
+    foreach my $detail ($xml->findnodes( '//a[contains(@class,"detalleItemFicha")]', $doc ))
+    {
+      my $tag = undef;
+      $tag = 'category' if $detail->previousSibling->textContent =~ /G.+nero/;
+      $tag = 'country' if $detail->previousSibling->textContent =~ /P.+s/;
+      $description .= '<'.$tag.' lang="es">'.$detail->textContent.'</'.$tag.'>' if defined($tag);
+    }
+    my $actors = '';
+    foreach my $detail ($xml->findnodes( '//div[contains(@class,"contenedorActores")]/a', $doc ))
+    {
+      $actors .= '<actor>'.$detail->textContent.'</actor>';
+
+    }
+    $description .= '<credits>'.$actors.'</credits>' unless $actors eq '';
+    return $description;
 }
 
 sub write_header
@@ -665,7 +711,7 @@ sub normalize_string
 {
   my( $string ) = @_;
   $string =~ s/&/&amp;/sg;
-  return $string;
+  return encode("utf8", decode("iso-8859-1", $string));
 }
 
 sub channel_id
